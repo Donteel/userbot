@@ -12,11 +12,15 @@ import asyncio
 import logging
 import os
 import random
+import time
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 import aiosqlite
 from dotenv import load_dotenv
 from pyrogram import Client, enums, filters, idle
-from pyrogram.types import Message
+from pyrogram.errors import ChatAdminRequired, UserNotParticipant
+from pyrogram.types import Chat, Message
 
 load_dotenv()
 
@@ -27,6 +31,9 @@ SESSION_NAME = os.getenv("SESSION_NAME", "my_account")
 SESSION_STRING = os.getenv("SESSION_STRING", "").strip() or None
 WORKDIR = os.getenv("WORKDIR", ".")
 CHANNEL_LINK = os.getenv("CHANNEL_LINK", "https://t.me/+fpeV0o0QOIo4MTli")
+# Часовой пояс для статистики «за сегодня»
+TZ = ZoneInfo(os.getenv("TZ_NAME", "Asia/Jerusalem"))
+STARTED_AT = time.time()
 DB_FILE = os.getenv("DB_FILE", "users.db")
 IGNORE_FILE = os.getenv("IGNORE_FILE", "ignore_list.txt")
 
@@ -208,6 +215,26 @@ class Storage:
         )
         return await cur.fetchall()
 
+    async def stats(self, since_utc: str, until_utc: str | None = None) -> dict:
+        until_utc = until_utc or "9999-12-31"
+        cur = await self.db.execute(
+            "SELECT COUNT(*), SUM(stage >= 1), SUM(stage >= 2) FROM users "
+            "WHERE created_at >= ? AND created_at < ?",
+            (since_utc, until_utc),
+        )
+        total, first, second = await cur.fetchone()
+        return {"total": total or 0, "first": first or 0, "second": second or 0}
+
+    async def users_since(self, since_utc: str) -> list[tuple[int, str]]:
+        cur = await self.db.execute(
+            "SELECT user_id, name FROM users WHERE created_at >= ?", (since_utc,)
+        )
+        return await cur.fetchall()
+
+    async def count_ignored(self) -> int:
+        cur = await self.db.execute("SELECT COUNT(*) FROM ignored")
+        return (await cur.fetchone())[0]
+
     async def count(self) -> int:
         cur = await self.db.execute("SELECT COUNT(*) FROM users")
         return (await cur.fetchone())[0]
@@ -338,13 +365,23 @@ async def on_private_message(client: Client, message: Message) -> None:
 # ---------------------------------------------------------------------------
 
 HELP_TEXT = (
+    "🤖 Автоответчик\n\n"
+    "Что делает: каждому, кто впервые пишет в личку, через 1–2 мин отвечает, "
+    "что вакансия уже не актуальна, а ещё через ~5 мин советует канал. "
+    "Каждому только один раз, с «печатает…». Люди из списка «не отвечать» "
+    "и боты игнорируются.\n\n"
     "Команды (пишите сюда, в Избранное):\n"
-    "/ignore — добавить в список «не отвечать» (спрошу username)\n"
+    "/help — эта справка\n"
+    "/test — проверить, что бот работает\n"
+    "/stats — статистика: сколько написали сегодня, за неделю и всего, "
+    "и сколько из них уже в канале\n"
+    "/ignore — добавить в «не отвечать» (спрошу username)\n"
     "/ignore @user1 @user2 — добавить сразу\n"
     "/unignore @user — убрать из списка\n"
     "/ignorelist — показать список\n"
-    "/cancel — отменить\n\n"
-    "Или напишите /ignore прямо в чате с человеком."
+    "/cancel — отменить ввод\n\n"
+    "Ещё можно написать /ignore прямо в чате с человеком — он попадёт в список, "
+    "а команда удалится."
 )
 
 awaiting: dict[str, str] = {}      # {"action": "ignore" | "unignore"}
@@ -393,6 +430,109 @@ async def apply_action(client: Client, action: str, tokens: list[str]) -> None:
     await say(client, "\n".join(lines) or "Не увидел ни одного username")
 
 
+# ---------------------------------------------------------------------------
+# /test и /stats
+# ---------------------------------------------------------------------------
+
+_channel_cache: dict[str, int] = {}
+
+
+async def get_channel_id(client: Client) -> tuple[int | None, str]:
+    """Находит канал по ссылке. Возвращает (id, пояснение)."""
+    if "id" in _channel_cache:
+        return _channel_cache["id"], ""
+    try:
+        chat = await client.get_chat(CHANNEL_LINK)
+    except Exception as e:
+        return None, f"не удалось открыть канал по ссылке ({e.__class__.__name__})"
+    if not isinstance(chat, Chat):
+        return None, "аккаунт не состоит в канале, вступите в него"
+    _channel_cache["id"] = chat.id
+    return chat.id, ""
+
+
+def utc_str(dt: datetime) -> str:
+    return dt.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+
+async def cmd_test(client: Client) -> None:
+    lines = ["🩺 Проверка бота"]
+    t0 = time.monotonic()
+    try:
+        me = await client.get_me()
+        ping = (time.monotonic() - t0) * 1000
+        lines.append(f"✅ Telegram: подключён как {me.first_name}, ответ за {ping:.0f} мс")
+    except Exception as e:
+        lines.append(f"❌ Telegram: {e}")
+    try:
+        lines.append(
+            f"✅ База: {await storage.count()} собеседников, "
+            f"{await storage.count_ignored()} в «не отвечать»"
+        )
+    except Exception as e:
+        lines.append(f"❌ База: {e}")
+    lines.append(f"✅ Диалогов в работе сейчас: {len(tasks)}")
+    cid, why = await get_channel_id(client)
+    lines.append(f"✅ Канал найден" if cid else f"⚠️ Канал: {why}")
+    up = int(time.time() - STARTED_AT)
+    lines.append(f"⏱ Работает без перезапуска: {up // 3600} ч {up % 3600 // 60} мин")
+    await say(client, "\n".join(lines))
+
+
+async def count_in_channel(client: Client, users: list[tuple[int, str]]) -> str:
+    if not users:
+        return "—"
+    cid, why = await get_channel_id(client)
+    if not cid:
+        return f"не проверить: {why}"
+    inside = 0
+    for uid, _ in users[:300]:
+        try:
+            m = await client.get_chat_member(cid, uid)
+            if m.status not in (enums.ChatMemberStatus.LEFT, enums.ChatMemberStatus.BANNED):
+                inside += 1
+        except UserNotParticipant:
+            pass
+        except ChatAdminRequired:
+            return "не проверить: список подписчиков видит только админ канала"
+        except Exception:
+            pass
+        await asyncio.sleep(0.3)  # бережём аккаунт от лимитов Telegram
+    note = " (проверены первые 300)" if len(users) > 300 else ""
+    return f"{inside} из {len(users)}{note}"
+
+
+async def cmd_stats(client: Client) -> None:
+    now = datetime.now(TZ)
+    today = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    yesterday = today - timedelta(days=1)
+    week = today - timedelta(days=6)
+
+    t = await storage.stats(utc_str(today))
+    y = await storage.stats(utc_str(yesterday), utc_str(today))
+    w = await storage.stats(utc_str(week))
+    a = await storage.stats("0000-01-01")
+
+    await say(client, "⏳ Считаю, проверяю подписки на канал…")
+    in_today = await count_in_channel(client, await storage.users_since(utc_str(today)))
+    in_week = await count_in_channel(client, await storage.users_since(utc_str(week)))
+
+    def row(label: str, d: dict) -> str:
+        return f"{label}: {d['total']} (ответ получили {d['first']}, совет с каналом {d['second']})"
+
+    text = (
+        f"📊 Статистика на {now:%d.%m %H:%M}\n\n"
+        f"{row('Сегодня', t)}\n"
+        f"{row('Вчера', y)}\n"
+        f"{row('За 7 дней', w)}\n"
+        f"{row('Всего', a)}\n\n"
+        f"В канале из написавших сегодня: {in_today}\n"
+        f"В канале из написавших за 7 дней: {in_week}\n\n"
+        f"В «не отвечать»: {await storage.count_ignored()}"
+    )
+    await say(client, text)
+
+
 @app.on_message(filters.me & filters.private & filters.text)
 async def on_my_message(client: Client, message: Message) -> None:
     if message.id in bot_replies:
@@ -439,6 +579,10 @@ async def on_my_message(client: Client, message: Message) -> None:
             # Telegram ограничивает сообщение 4096 символами
             for chunk_start in range(0, len(body), 4000):
                 await say(client, f"Не отвечаю ({len(rows)}):\n" + body[chunk_start:chunk_start + 4000])
+    elif cmd == "/test":
+        await cmd_test(client)
+    elif cmd == "/stats":
+        await cmd_stats(client)
     elif cmd == "/cancel":
         awaiting.clear()
         await say(client, "Ок, отменил")

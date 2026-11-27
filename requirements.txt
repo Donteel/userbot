@@ -2,3 +2,4 @@ pyrogram==2.0.106
 tgcrypto
 python-dotenv>=1.0
 aiosqlite>=0.19
+tzdata
