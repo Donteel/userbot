@@ -1,0 +1,16 @@
+# Альтернатива Docker: systemd.
+# Скопировать: sudo cp userbot.service /etc/systemd/system/
+# Затем: sudo systemctl daemon-reload && sudo systemctl enable --now userbot
+[Unit]
+Description=Telegram userbot autoreply
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+WorkingDirectory=/opt/userbot
+ExecStart=/opt/userbot/venv/bin/python bot.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
