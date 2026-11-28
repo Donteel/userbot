@@ -9,6 +9,7 @@ Userbot-автоответчик на Pyrogram.
 """
 
 import asyncio
+import contextvars
 import logging
 import os
 import random
@@ -34,6 +35,8 @@ CHANNEL_LINK = os.getenv("CHANNEL_LINK", "https://t.me/+fpeV0o0QOIo4MTli")
 # Часовой пояс для статистики «за сегодня»
 TZ = ZoneInfo(os.getenv("TZ_NAME", "Asia/Jerusalem"))
 STARTED_AT = time.time()
+# Админы — те, кто может управлять ботом, написав ему в личку. Владелец аккаунта — всегда админ.
+ADMIN_IDS = [int(x) for x in os.getenv("ADMIN_IDS", "663767660").replace(",", " ").split() if x.strip().lstrip("-").isdigit()]
 DB_FILE = os.getenv("DB_FILE", "users.db")
 IGNORE_FILE = os.getenv("IGNORE_FILE", "ignore_list.txt")
 
@@ -108,6 +111,15 @@ class Storage:
         await self.db.execute(
             "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)"
         )
+        await self.db.execute(
+            """CREATE TABLE IF NOT EXISTS admins (
+                   user_id  INTEGER PRIMARY KEY,
+                   added_by INTEGER,
+                   added_at TEXT NOT NULL DEFAULT (datetime('now'))
+               )"""
+        )
+        for aid in ADMIN_IDS:
+            await self.db.execute("INSERT OR IGNORE INTO admins (user_id) VALUES (?)", (aid,))
         await self.db.commit()
         await self._import_existing_once()
         await self._import_ignore_file()
@@ -235,6 +247,28 @@ class Storage:
         cur = await self.db.execute("SELECT COUNT(*) FROM ignored")
         return (await cur.fetchone())[0]
 
+    # ---- админы ----
+
+    async def is_admin(self, user_id: int) -> bool:
+        cur = await self.db.execute("SELECT 1 FROM admins WHERE user_id = ?", (user_id,))
+        return await cur.fetchone() is not None
+
+    async def add_admin(self, user_id: int, added_by: int) -> bool:
+        cur = await self.db.execute(
+            "INSERT OR IGNORE INTO admins (user_id, added_by) VALUES (?, ?)", (user_id, added_by)
+        )
+        await self.db.commit()
+        return cur.rowcount == 1
+
+    async def remove_admin(self, user_id: int) -> bool:
+        cur = await self.db.execute("DELETE FROM admins WHERE user_id = ?", (user_id,))
+        await self.db.commit()
+        return cur.rowcount > 0
+
+    async def list_admins(self) -> list[int]:
+        cur = await self.db.execute("SELECT user_id FROM admins ORDER BY added_at")
+        return [r[0] for r in await cur.fetchall()]
+
     async def count(self) -> int:
         cur = await self.db.execute("SELECT COUNT(*) FROM users")
         return (await cur.fetchone())[0]
@@ -341,6 +375,11 @@ async def on_private_message(client: Client, message: Message) -> None:
     user = message.from_user
     if user is None or user.is_self or user.is_bot or user.is_support:
         return
+    # Админу бот не отвечает по сценарию, а выполняет его команды
+    if await storage.is_admin(user.id):
+        if message.text:
+            await handle_command(client, message, user.id)
+        return
     if await storage.is_ignored(user.id, user.username):
         return
     name = user.username or user.first_name or str(user.id)
@@ -370,7 +409,8 @@ HELP_TEXT = (
     "что вакансия уже не актуальна, а ещё через ~5 мин советует канал. "
     "Каждому только один раз, с «печатает…». Люди из списка «не отвечать» "
     "и боты игнорируются.\n\n"
-    "Команды (пишите сюда, в Избранное):\n"
+    "Команды работают только для админов: владелец пишет их себе в Избранное, "
+    "другие админы — в личку этому аккаунту.\n"
     "/help — эта справка\n"
     "/test — проверить, что бот работает\n"
     "/stats — статистика: сколько написали сегодня, за неделю и всего, "
@@ -379,17 +419,22 @@ HELP_TEXT = (
     "/ignore @user1 @user2 — добавить сразу\n"
     "/unignore @user — убрать из списка\n"
     "/ignorelist — показать список\n"
-    "/cancel — отменить ввод\n\n"
+    "/cancel — отменить ввод\n"
+    "/admins — список админов\n"
+    "/addadmin 123456789 — добавить админа по id\n"
+    "/deladmin 123456789 — убрать админа\n\n"
     "Ещё можно написать /ignore прямо в чате с человеком — он попадёт в список, "
     "а команда удалится."
 )
 
-awaiting: dict[str, str] = {}      # {"action": "ignore" | "unignore"}
+awaiting: dict[int, str] = {}      # {chat_id: "ignore" | "unignore"}
 bot_replies: set[int] = set()     # id наших ответов в Избранном, чтобы не принять их за ввод
+reply_chat: contextvars.ContextVar = contextvars.ContextVar("reply_chat", default="me")
 
 
 async def say(client: Client, text: str) -> None:
-    msg = await client.send_message("me", text)
+    """Отвечает туда, откуда пришла команда: в Избранное или в личку админа."""
+    msg = await client.send_message(reply_chat.get(), text)
     bot_replies.add(msg.id)
 
 
@@ -537,6 +582,7 @@ async def cmd_stats(client: Client) -> None:
 async def on_my_message(client: Client, message: Message) -> None:
     if message.id in bot_replies:
         return
+    reply_chat.set("me")
     text = message.text.strip()
     is_saved = message.chat.id == client.me.id
 
@@ -553,6 +599,14 @@ async def on_my_message(client: Client, message: Message) -> None:
             await say(client, f"✅ {label} — больше не отвечаю")
         return
 
+    await handle_command(client, message, client.me.id)
+
+
+async def handle_command(client: Client, message: Message, sender_id: int) -> None:
+    """Команды от владельца (в Избранном) или от админа (в личке)."""
+    chat_id = message.chat.id
+    reply_chat.set(chat_id if chat_id != client.me.id else "me")
+    text = message.text.strip()
     parts = text.split()
     cmd = parts[0].lower().split("@")[0] if parts else ""
 
@@ -561,10 +615,10 @@ async def on_my_message(client: Client, message: Message) -> None:
     elif cmd in ("/ignore", "/unignore"):
         action = cmd[1:]
         if len(parts) > 1:
-            awaiting.clear()
+            awaiting.pop(chat_id, None)
             await apply_action(client, action, parts[1:])
         else:
-            awaiting["action"] = action
+            awaiting[chat_id] = action
             verb = "не отвечать" if action == "ignore" else "убрать из списка"
             await say(client, f"Пришли username, кому {verb} (можно несколько через пробел). /cancel — отмена")
     elif cmd == "/ignorelist":
@@ -584,10 +638,37 @@ async def on_my_message(client: Client, message: Message) -> None:
     elif cmd == "/stats":
         await cmd_stats(client)
     elif cmd == "/cancel":
-        awaiting.clear()
+        awaiting.pop(chat_id, None)
         await say(client, "Ок, отменил")
-    elif "action" in awaiting and not text.startswith("/"):
-        action = awaiting.pop("action")
+    elif cmd == "/admins":
+        ids = await storage.list_admins()
+        lines = []
+        for aid in ids:
+            try:
+                u = await client.get_users(aid)
+                lines.append(f"• {aid} — {u.first_name or ''}{(' @' + u.username) if u.username else ''}")
+            except Exception:
+                lines.append(f"• {aid}")
+        await say(client, "Админы (плюс владелец аккаунта):\n" + ("\n".join(lines) or "пока никого"))
+    elif cmd in ("/addadmin", "/deladmin"):
+        ids = [int(p) for p in parts[1:] if p.lstrip("-").isdigit()]
+        if not ids:
+            await say(client, f"Укажи числовой id: {cmd} 123456789\n"
+                              "Узнать id человека можно, например, через @userinfobot")
+        else:
+            out = []
+            for aid in ids:
+                if cmd == "/addadmin":
+                    ok = await storage.add_admin(aid, sender_id)
+                    out.append(f"✅ {aid} теперь админ" if ok else f"ℹ️ {aid} уже админ")
+                elif aid == sender_id:
+                    out.append("⚠️ Себя убрать нельзя")
+                else:
+                    ok = await storage.remove_admin(aid)
+                    out.append(f"✅ {aid} больше не админ" if ok else f"ℹ️ {aid} не был админом")
+            await say(client, "\n".join(out))
+    elif chat_id in awaiting and not text.startswith("/"):
+        action = awaiting.pop(chat_id)
         await apply_action(client, action, text.replace(",", " ").split())
 
 
